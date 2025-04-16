@@ -1,5 +1,5 @@
-// utils/socket.js
 const socketIO = require("socket.io");
+const redisAdapter = require("socket.io-redis");
 
 let io;
 
@@ -7,10 +7,14 @@ module.exports = {
   init: (httpServer) => {
     io = socketIO(httpServer, {
       cors: {
-        origin: "*", // Adjust as needed
+        origin: "*",
         methods: ["GET", "POST"],
       },
     });
+
+    // Integrate Redis for scaling Socket.IO
+    io.adapter(redisAdapter({ host: "localhost", port: 6379 }));
+
     return io;
   },
   getIO: () => {

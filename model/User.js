@@ -5,28 +5,44 @@ const userSchema = mongoose.Schema(
   {
     username: {
       type: String,
-      required: [true, "username must be required"],
+      required: [true, "Username is required"],
       unique: true,
+      trim: true,
+      maxlength: [30, "Username cannot exceed 30 characters"],
     },
     email: {
       type: String,
-      required: [true, "email must be required"],
+      required: [true, "Email is required"],
       unique: true,
+      match: [/^\S+@\S+\.\S+$/, "Please provide a valid email address"],
     },
     password: {
       type: String,
-      required: [true, "password must be required"],
-      minlength: [8, "password must be at least 8 characters long"],
-      select: false, // hide password from the database
+      required: [true, "Password is required"],
+      minlength: [6, "Password must be at least 6 characters"],
+      select: false,
     },
     role: {
       type: String,
-      enum: ["user", "streamer", "admin"],
+      enum: ["user", "streamer", "admin"], // Add admin
       default: "user",
-    }, // New field for role
-    avatar: { type: String, default: "default-avatar.png" }, // New field
-    followers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-    following: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+    },
+    avatar: {
+      type: String,
+      default: "default-avatar.png",
+    },
+    followers: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
+    ],
+    following: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
+    ],
   },
   {
     timestamps: true,

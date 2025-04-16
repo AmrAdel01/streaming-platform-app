@@ -14,6 +14,9 @@ exports.protect = asyncHandler(async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(decoded.id).select("-password");
     if (!user) return next(new ApiError("User not found", 401));
+    if (user.role === "banned") {
+      return next(new ApiError("Your account has been banned", 403));
+    }
     req.user = user;
     next();
   } catch (error) {

@@ -7,6 +7,8 @@ const {
   getProfile,
   followUser,
   unfollowUser,
+  getMe,
+  createAdmin,
 } = require("./../controller/user");
 const {
   SignUpValidator,
@@ -22,8 +24,10 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-router.route("/signup").post(SignUpValidator, signup);
+router.route("/signup").post(upload.single("avatar"), SignUpValidator, signup);
 router.route("/login").post(loginValidator, login);
+router.post("/create-admin", createAdmin); // Add this
+router.route("/users/me").post(protect, getMe);
 router.route("/profile").put(upload.single("avatar"), protect, updateProfile);
 router.route("/profile/:id").get(protect, getProfile); // Fixed line
 router.route("/follow/:id").post(protect, followUser);
