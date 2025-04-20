@@ -7,13 +7,16 @@ module.exports = {
   init: (httpServer) => {
     io = socketIO(httpServer, {
       cors: {
-        origin: "*",
+        origin: process.env.CORS_ORIGIN || "*",
         methods: ["GET", "POST"],
       },
     });
 
-    // Integrate Redis for scaling Socket.IO
-    io.adapter(redisAdapter({ host: "localhost", port: 6379 }));
+    io.adapter(
+      redisAdapter({
+        url: process.env.REDIS_URL || "redis://localhost:6379",
+      })
+    );
 
     return io;
   },

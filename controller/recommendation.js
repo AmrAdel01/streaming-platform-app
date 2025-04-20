@@ -7,24 +7,21 @@ exports.getRecommendedVideos = asyncHandler(async (req, res, next) => {
   const userId = req.user.id;
   const { limit = 10, skip = 0 } = req.query;
 
-  const user = await User.findById(userId).populate(
-    "watchHistory.video following"
-  );
+  const user = await User.findById(userId)
+    .populate("watchHistory.video following")
+    .lean()
+    .select("watchHistory following");
   if (!user) return next(new ApiError("User not found", 404));
 
-  // Get categories from watch history
   const watchedVideos = user.watchHistory
     .map((entry) => entry.video)
     .filter(Boolean);
   const watchedCategories = [...new Set(watchedVideos.map((v) => v.category))];
-
-  // Get followed streamers
   const followedIds = user.following.map((f) => f._id);
 
-  // Build recommendation query
   const query = {
-    status: "live", // Only recommend live videos
-    _id: { $nin: watchedVideos.map((v) => v._id) }, // Exclude already watched
+    status: "live",
+    _id: { $nin: watchedVideos.map((v) => v._id) },
     $or: [
       {
         category: {
@@ -37,16 +34,17 @@ exports.getRecommendedVideos = asyncHandler(async (req, res, next) => {
 
   const videos = await Video.find(query)
     .populate("uploader", "username role")
-    .sort({ views: -1, createdAt: -1 }) // Prioritize popular and recent videos
+    .sort({ views: -1, createdAt: -1 })
     .limit(parseInt(limit))
-    .skip(parseInt(skip));
+    .skip(parseInt(skip))
+    .lean()
+    .select("title thumbnail duration uploader views category");
 
   const total = await Video.countDocuments(query);
 
   res.status(200).json({
+    status: "success",
     message: "Recommended videos retrieved",
-    videos,
-    total,
-    page: Math.ceil(skip / limit) + 1,
+    data: { videos, total, page: Math.ceil(skip / limit) + 1 },
   });
 });

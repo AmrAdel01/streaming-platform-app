@@ -2,6 +2,9 @@ const ffmpeg = require("fluent-ffmpeg");
 const fsPromises = require("fs").promises;
 const path = require("path");
 const ApiError = require("../utils/ApiError");
+const { exec } = require("child_process");
+const util = require("util");
+const execPromise = util.promisify(exec);
 
 if (process.env.FFMPEG_PATH) {
   ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
@@ -12,155 +15,41 @@ ffmpeg.getAvailableCodecs((err, codecs) => {
     console.error("Failed to get FFmpeg codecs:", err);
     return;
   }
+  if (!codecs.libx264 || !codecs.aac) {
+    console.error("Required codecs (libx264, aac) are missing");
+    process.exit(1);
+  }
   console.log("FFmpeg codecs:", {
     libx264: !!codecs.libx264,
     aac: !!codecs.aac,
   });
 });
 
-const transcodeVideo = async (inputPath, outputDir, videoId) => {
-  if (!inputPath || !outputDir || !videoId) {
-    throw new ApiError("Missing required parameters for transcoding", 400);
-  }
-
-  console.log("Validating input file:", inputPath);
-  const fileExists = await fsPromises
-    .access(inputPath)
-    .then(() => true)
-    .catch(() => false);
-
-  if (!fileExists) {
-    throw new ApiError("Input video file is inaccessible", 400);
-  }
-
-  const probe = await new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(inputPath, (err, metadata) => {
-      if (err) return reject(err);
-      resolve(metadata);
-    });
-  });
-
-  console.log("Input file metadata:", probe);
-  const hasVideo = probe.streams.some((s) => s.codec_type === "video");
-  const hasAudio = probe.streams.some((s) => s.codec_type === "audio");
-  console.log("Input file streams:", { hasVideo, hasAudio });
-
-  if (!hasVideo) {
-    throw new ApiError("Input file has no video stream", 400);
-  }
-
-  const videoStream = probe.streams.find((s) => s.codec_type === "video");
-  const inputWidth = videoStream.width;
-  const inputHeight = videoStream.height;
-
-  const outputPath = path.join(outputDir, videoId);
-  const allResolutions = [
-    { name: "360p", width: 640, height: 360, bitrate: "800k" },
-    { name: "720p", width: 1280, height: 720, bitrate: "2800k" },
-    { name: "1080p", width: 1920, height: 1080, bitrate: "5000k" },
-  ];
-
-  const resolutions = allResolutions.filter(
-    (res) => inputWidth >= res.width && inputHeight >= res.height
-  );
-  if (resolutions.length === 0) {
-    resolutions.push({
-      name: "custom",
-      width: inputWidth,
-      height: inputHeight,
-      bitrate: "800k",
-    });
-  }
+exports.transcodeVideo = async (inputPath, outputDir, videoId) => {
+  console.log(`Starting FFmpeg transcoding for videoId: ${videoId}`);
+  console.log(`Input path: ${inputPath}, Output dir: ${outputDir}`);
 
   try {
-    console.log("Creating output directory:", outputPath);
-    await fsPromises.mkdir(outputPath, { recursive: true });
+    const outputPath = path.join(outputDir, "master.m3u8");
+    const ffmpegCommand = `"${process.env.FFMPEG_PATH}" -i "${inputPath}" -c:v libx264 -c:a aac -f hls -hls_time 10 -hls_list_size 0 -hls_segment_filename "${outputDir}/v%v/segment%d.ts" -master_pl_name master.m3u8 -var_stream_map "v:0,a:0" "${outputDir}/v%v/playlist.m3u8"`;
 
-    const hlsPath = await new Promise((resolve, reject) => {
-      const ffmpegCommand = ffmpeg(inputPath);
+    console.log(`Executing FFmpeg command: ${ffmpegCommand}`);
+    const { stdout, stderr } = await execPromise(ffmpegCommand);
 
-      // Generate variant playlists for each resolution
-      resolutions.forEach((res, index) => {
-        const outputFolder = path.join(outputPath, `v${index}`);
-        const outputFile = path.join(outputFolder, "playlist.m3u8");
-
-        const streamOptions = [
-          `-map v:0`,
-          `-s:v:${index} ${res.width}x${res.height}`,
-          `-b:v:${index} ${res.bitrate}`,
-          `-c:v:${index} libx264`,
-          `-preset fast`,
-          `-profile:v:${index} main`,
-          `-f hls`,
-          `-hls_time 10`,
-          `-hls_list_size 0`,
-          `-hls_segment_filename ${path.join(outputFolder, "segment_%03d.ts")}`,
-        ];
-
-        if (hasAudio) {
-          streamOptions.push(
-            `-map a:0`,
-            `-c:a:${index} aac`,
-            `-b:a:${index} 128k`
-          );
-        } else {
-          streamOptions.push("-an");
-        }
-
-        ffmpegCommand.output(outputFile).outputOptions(streamOptions);
-      });
-
-      // Generate the master playlist
-      const masterPlaylistPath = path.join(outputPath, "master.m3u8");
-      const masterPlaylistContent = [
-        "#EXTM3U",
-        "#EXT-X-VERSION:3",
-        ...resolutions.map((res, index) => {
-          const bandwidth = parseInt(res.bitrate) * 1000;
-          return `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${res.width}x${res.height}\nv${index}/playlist.m3u8`;
-        }),
-      ].join("\n");
-
-      // Write the master playlist manually
-      fsPromises.writeFile(masterPlaylistPath, masterPlaylistContent);
-
-      ffmpegCommand
-        .on("start", (commandLine) => {
-          console.log("FFmpeg command:", commandLine);
-        })
-        .on("progress", (progress) => {
-          console.log(`Transcoding progress: ${progress.percent}%`);
-        })
-        .on("end", () => {
-          console.log("Transcoding completed");
-          const relativeHlsPath = path.join(outputDir, videoId, "master.m3u8");
-          resolve(relativeHlsPath);
-        })
-        .on("error", (err, stdout, stderr) => {
-          console.error("FFmpeg error:", err.message);
-          console.error("FFmpeg stdout:", stdout);
-          console.error("FFmpeg stderr:", stderr);
-          reject(new Error(`FFmpeg transcoding failed: ${err.message}`));
-        })
-        .run();
-    });
-
-    return hlsPath;
-  } catch (err) {
-    console.error("Transcode error:", err);
-    const exists = await fsPromises
-      .access(outputPath)
-      .then(() => true)
-      .catch(() => false);
-
-    if (exists) {
-      await fsPromises
-        .rm(outputPath, { recursive: true, force: true })
-        .catch((e) => console.error("Cleanup failed:", e));
+    console.log(`FFmpeg stdout: ${stdout}`);
+    if (stderr) {
+      console.warn(`FFmpeg stderr: ${stderr}`);
     }
 
-    throw new ApiError(`Failed to transcode video: ${err.message}`, 500);
+    const hlsPath = path.join("uploads/videos", videoId, "master.m3u8");
+    console.log(`Transcoding successful, hlsPath: ${hlsPath}`);
+    return hlsPath;
+  } catch (error) {
+    console.error(`FFmpeg transcoding failed for videoId: ${videoId}:`, {
+      message: error.message,
+      stderr: error.stderr || "No stderr",
+      stdout: error.stdout || "No stdout",
+    });
+    throw new Error(`Transcoding failed: ${error.message}`);
   }
 };
-
-module.exports = { transcodeVideo };

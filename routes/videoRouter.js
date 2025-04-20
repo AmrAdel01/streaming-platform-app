@@ -2,10 +2,10 @@ const express = require("express");
 const ApiError = require("./../utils/ApiError");
 const multer = require("multer");
 const path = require("path");
-const fsPromises = require("fs").promises; // Use promises
+const fsPromises = require("fs").promises;
 const rateLimit = require("express-rate-limit");
 const {
-  uploadVideos,
+  uploadVideo,
   streamVideo,
   getUserVideos,
   deleteVideo,
@@ -27,17 +27,15 @@ const { protect } = require("./../middleware/authMiddleware");
 
 const router = express.Router({ mergeParams: true });
 
-// Rate limiting for comment, like, and dislike endpoints
 const actionLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50, // Limit each IP to 50 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 50,
   message: "Too many actions, please try again later.",
 });
 
-// Multer configuration for video upload
 const storage = multer.diskStorage({
   destination: async function (req, file, cb) {
-    const uploadDir = path.join(__dirname, "../../uploads");
+    const uploadDir = path.join(__dirname, "../../Uploads");
     try {
       await fsPromises.mkdir(uploadDir, { recursive: true });
       cb(null, uploadDir);
@@ -54,14 +52,22 @@ const storage = multer.diskStorage({
 
 const fileFilter = (req, file, cb) => {
   if (file.fieldname === "video") {
-    if (!file.mimetype.startsWith("video/")) {
-      return cb(new ApiError("Only video files are allowed", 400), false);
+    const allowedVideoTypes = ["video/mp4", "video/webm"];
+    if (!allowedVideoTypes.includes(file.mimetype)) {
+      return cb(
+        new ApiError("Only MP4 and WebM video files are allowed", 400),
+        false
+      );
     }
     cb(null, true);
   } else if (file.fieldname === "thumbnail") {
-    if (!file.mimetype.startsWith("image/")) {
+    const allowedImageTypes = ["image/jpeg", "image/png"];
+    if (!allowedImageTypes.includes(file.mimetype)) {
       return cb(
-        new ApiError("Only image files are allowed for thumbnail", 400),
+        new ApiError(
+          "Only JPG and PNG image files are allowed for thumbnail",
+          400
+        ),
         false
       );
     }
@@ -74,14 +80,13 @@ const fileFilter = (req, file, cb) => {
 const upload = multer({
   storage,
   fileFilter,
-  limits: { fileSize: 1024 * 1024 * 100 }, // 100MB
+  limits: { fileSize: 1024 * 1024 * 100 },
 }).fields([
   { name: "video", maxCount: 1 },
   { name: "thumbnail", maxCount: 1 },
 ]);
 
-// Routes
-router.post("/upload", protect, upload, uploadVideos);
+router.post("/upload", protect, actionLimiter, upload, uploadVideo);
 router.get("/user-videos", protect, getUserVideos);
 router.get("/search", searchVideo);
 router.get("/stream/:id", streamVideo);

@@ -1,35 +1,38 @@
 const mongoose = require("mongoose");
 
-const notificationSchema = mongoose.Schema(
+const notificationSchema = new mongoose.Schema(
   {
-    user: {
+    recipient: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      required: [true, "User is required"],
+      required: true,
     },
     message: {
       type: String,
-      required: [true, "Message is required"],
+      required: true,
+      maxlength: [500, "Message cannot exceed 500 characters"],
     },
     type: {
       type: String,
       enum: [
         "video_upload",
-        "live_stream",
-        "follow",
-        "comment",
-        "report_update",
+        "video_approved",
+        "video_rejected",
         "video_pending",
+        "live_stream",
+        "report_update",
+        "transcode_failure",
       ],
       required: true,
     },
-    target: {
+    referenceId: {
       type: mongoose.Schema.Types.ObjectId,
-      refPath: "targetModel", // Dynamic reference
+      required: true,
     },
-    targetModel: {
+    referenceModel: {
       type: String,
-      enum: ["Video", "User", "Comment"], // Models that can be targeted
+      enum: ["Video", "Report"],
+      required: true,
     },
     read: {
       type: Boolean,
@@ -41,5 +44,6 @@ const notificationSchema = mongoose.Schema(
   }
 );
 
-const notificationModel = mongoose.model("Notification", notificationSchema);
-module.exports = notificationModel;
+const Notification = mongoose.model("Notification", notificationSchema);
+
+module.exports = Notification;

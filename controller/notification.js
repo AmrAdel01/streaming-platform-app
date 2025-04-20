@@ -12,9 +12,10 @@ exports.createNotification = asyncHandler(
         "like",
         "follow",
         "live_stream",
-        "video_pending", // Add this
+        "video_pending",
         "video_approved",
         "video_rejected",
+        "report_update",
       ].includes(type)
     ) {
       throw new ApiError("Invalid notification type", 400);
@@ -52,19 +53,30 @@ exports.getNotifications = asyncHandler(async (req, res, next) => {
   }
 
   const notifications = await Notification.find({ user: userId })
-    .populate({ path: "target", strictPopulate: false })
+    .populate({
+      path: "target",
+      strictPopulate: false,
+      model: (notification) => notification.targetModel,
+    })
     .sort({ createdAt: -1 })
     .limit(parsedLimit)
-    .skip(parsedSkip);
+    .skip(parsedSkip)
+    .lean()
+    .select("message type target targetModel read createdAt");
 
-  const validNotifications = notifications.filter((n) => n.target);
+  // Filter out notifications with invalid or deleted targets
+  const validNotifications = notifications.filter((n) => {
+    if (!n.target) {
+      console.warn(`Notification ${n._id} has no valid target`);
+      return false;
+    }
+    return true;
+  });
 
-  const total = validNotifications.length
-    ? await Notification.countDocuments({
-        user: userId,
-        target: { $exists: true, $ne: null },
-      })
-    : 0;
+  const total = await Notification.countDocuments({
+    user: userId,
+    target: { $exists: true },
+  });
 
   const unread = await Notification.countDocuments({
     user: userId,
@@ -72,10 +84,9 @@ exports.getNotifications = asyncHandler(async (req, res, next) => {
   });
 
   res.status(200).json({
+    status: "success",
     message: "Notifications retrieved",
-    notifications: validNotifications, // Return filtered notifications
-    total,
-    unread,
+    data: { notifications: validNotifications, total, unread },
   });
 });
 
@@ -87,13 +98,15 @@ exports.markAsRead = asyncHandler(async (req, res, next) => {
     { _id: notificationId, user: userId },
     { read: true },
     { new: true }
-  );
+  ).lean();
 
   if (!notification) {
     return next(new ApiError("Notification not found or unauthorized", 404));
   }
 
-  res
-    .status(200)
-    .json({ message: "Notification marked as read", notification });
+  res.status(200).json({
+    status: "success",
+    message: "Notification marked as read",
+    data: { notification },
+  });
 });

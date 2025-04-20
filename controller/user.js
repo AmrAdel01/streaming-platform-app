@@ -1,79 +1,271 @@
-const User = require("./../model/User");
-const Video = require("./../model/Video");
 const asyncHandler = require("express-async-handler");
-const ApiError = require("./../utils/ApiError");
+const User = require("../model/User");
 const jwt = require("jsonwebtoken");
-const fs = require("fs").promises;
+const ApiError = require("../utils/ApiError");
 const path = require("path");
+const fsPromises = require("fs").promises;
+const { sanitizeInput } = require("../utils/sanitize");
 
-// Helper to format user response
-const formatUserResponse = (user) => ({
-  id: user._id,
-  username: user.username,
-  email: user.email,
-  role: user.role,
-  avatar: user.avatar,
-  followers: user.followers || [],
-  following: user.following || [],
-});
-
-// Generate token
-const generateToken = (user) => {
-  if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is not defined");
-  return jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, {
-    expiresIn: "5d",
-  });
+const generateToken = (id) => {
+  return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: "5d" });
 };
 
 exports.signup = asyncHandler(async (req, res, next) => {
   const { username, email, password, role } = req.body;
+  let avatarPath = "/uploads/default-avatar.png";
 
-  if (role && !["user", "streamer"].includes(role)) {
-    return next(
-      new ApiError("Invalid role. Must be 'user' or 'streamer'", 400)
-    );
+  const sanitizedUsername = sanitizeInput(username);
+  const sanitizedEmail = sanitizeInput(email);
+  if (!sanitizedUsername || !sanitizedEmail || !password) {
+    return next(new ApiError("All fields are required", 400));
   }
-
-  const userExist = await User.findOne({ email });
-  if (userExist) {
-    return next(new ApiError("User already exists", 400));
+  if (sanitizedUsername.length > 30) {
+    return next(new ApiError("Username cannot exceed 30 characters", 400));
   }
-
-  const userData = {
-    username,
-    email,
-    password,
-    role: role || "user",
-  };
 
   if (req.file) {
-    userData.avatar = req.file.path;
+    avatarPath = `/uploads/${path.basename(req.file.path)}`;
   }
 
-  const user = await User.create(userData);
+  const existingUser = await User.findOne({
+    $or: [{ email: sanitizedEmail }, { username: sanitizedUsername }],
+  });
+  if (existingUser) {
+    return next(new ApiError("Username or email already exists", 400));
+  }
+
+  const user = await User.create({
+    username: sanitizedUsername,
+    email: sanitizedEmail,
+    password,
+    role,
+    avatar: avatarPath,
+  });
+
+  const token = generateToken(user._id);
 
   res.status(201).json({
+    status: "success",
     message: "User registered successfully",
-    user: formatUserResponse(user),
-    token: generateToken(user),
+    data: {
+      user: {
+        _id: user._id,
+        username: user.username,
+        email: user.email,
+        avatar: user.avatar,
+        role: user.role,
+      },
+      token,
+    },
   });
 });
 
 exports.login = asyncHandler(async (req, res, next) => {
   const { email, password } = req.body;
-  if (!email || !password) {
+
+  const sanitizedEmail = sanitizeInput(email);
+  if (!sanitizedEmail || !password) {
     return next(new ApiError("Email and password are required", 400));
   }
 
-  const user = await User.findOne({ email }).select("+password");
+  const user = await User.findOne({ email: sanitizedEmail }).select(
+    "+password"
+  );
   if (!user || !(await user.comparePassword(password))) {
     return next(new ApiError("Invalid email or password", 401));
   }
 
-  res.json({
+  if (user.role === "banned") {
+    return next(new ApiError("Your account has been banned", 403));
+  }
+
+  const token = generateToken(user._id);
+
+  res.status(200).json({
+    status: "success",
     message: "User logged in successfully",
-    user: formatUserResponse(user),
-    token: generateToken(user),
+    data: {
+      user: {
+        _id: user._id,
+        username: user.username,
+        email: user.email,
+        avatar: user.avatar,
+        role: user.role,
+      },
+      token,
+    },
+  });
+});
+
+exports.updateProfile = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  const { username, email } = req.body;
+
+  const sanitizedUsername = sanitizeInput(username);
+  const sanitizedEmail = sanitizeInput(email);
+
+  const updates = {};
+  if (sanitizedUsername) {
+    if (sanitizedUsername.length > 30) {
+      return next(new ApiError("Username cannot exceed 30 characters", 400));
+    }
+    updates.username = sanitizedUsername;
+  }
+  if (sanitizedEmail) {
+    if (!/^\S+@\S+\.\S+$/.test(sanitizedEmail)) {
+      return next(new ApiError("Invalid email format", 400));
+    }
+    updates.email = sanitizedEmail;
+  }
+
+  if (req.file) {
+    updates.avatar = `/uploads/${path.basename(req.file.path)}`;
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return next(new ApiError("No valid fields provided for update", 400));
+  }
+
+  const existingUser = await User.findOne({
+    $or: [{ email: updates.email }, { username: updates.username }],
+    _id: { $ne: userId },
+  });
+  if (existingUser) {
+    return next(new ApiError("Username or email already exists", 400));
+  }
+
+  const user = await User.findByIdAndUpdate(userId, updates, {
+    new: true,
+    runValidators: true,
+  }).select("-password");
+
+  if (!user) {
+    return next(new ApiError("User not found", 404));
+  }
+
+  if (req.file && req.user.avatar && req.user.avatar !== "default-avatar.png") {
+    const oldAvatarPath = path.join(__dirname, "../", req.user.avatar);
+    await fsPromises
+      .unlink(oldAvatarPath)
+      .catch((err) => console.error("Failed to delete old avatar:", err));
+  }
+
+  res.status(200).json({
+    status: "success",
+    message: "Profile updated successfully",
+    data: { user },
+  });
+});
+
+exports.getProfile = asyncHandler(async (req, res, next) => {
+  const userId = req.params.id;
+
+  const user = await User.findById(userId)
+    .populate("followers", "username avatar")
+    .populate("following", "username avatar")
+    .lean()
+    .select("username avatar role followers following createdAt");
+
+  if (!user) {
+    return next(new ApiError("User not found", 404));
+  }
+
+  res.status(200).json({
+    status: "success",
+    message: "User profile retrieved successfully",
+    data: { user },
+  });
+});
+
+exports.followUser = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  const targetId = req.params.id;
+
+  if (userId === targetId) {
+    return next(new ApiError("Cannot follow yourself", 400));
+  }
+
+  const user = await User.findById(userId);
+  const targetUser = await User.findById(targetId);
+
+  if (!targetUser) {
+    return next(new ApiError("Target user not found", 404));
+  }
+
+  if (user.following.includes(targetId)) {
+    return next(new ApiError("Already following this user", 400));
+  }
+
+  user.following.push(targetId);
+  targetUser.followers.push(userId);
+
+  await Promise.all([user.save(), targetUser.save()]);
+
+  res.status(200).json({
+    status: "success",
+    message: `Successfully followed ${targetUser.username}`,
+    data: {
+      user: {
+        _id: user._id,
+        following: user.following,
+      },
+    },
+  });
+});
+
+exports.unfollowUser = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  const targetId = req.params.id;
+
+  if (userId === targetId) {
+    return next(new ApiError("Cannot unfollow yourself", 400));
+  }
+
+  const user = await User.findById(userId);
+  const targetUser = await User.findById(targetId);
+
+  if (!targetUser) {
+    return next(new ApiError("Target user not found", 404));
+  }
+
+  if (!user.following.includes(targetId)) {
+    return next(new ApiError("Not following this user", 400));
+  }
+
+  user.following = user.following.filter((id) => id.toString() !== targetId);
+  targetUser.followers = targetUser.followers.filter(
+    (id) => id.toString() !== userId
+  );
+
+  await Promise.all([user.save(), targetUser.save()]);
+
+  res.status(200).json({
+    status: "success",
+    message: `Successfully unfollowed ${targetUser.username}`,
+    data: {
+      user: {
+        _id: user._id,
+        following: user.following,
+      },
+    },
+  });
+});
+
+exports.getMe = asyncHandler(async (req, res, next) => {
+  const user = await User.findById(req.user.id)
+    .populate("followers", "username avatar")
+    .populate("following", "username avatar")
+    .lean()
+    .select("username email avatar role followers following createdAt");
+
+  if (!user) {
+    return next(new ApiError("User not found", 404));
+  }
+
+  res.status(200).json({
+    status: "success",
+    message: "Authenticated user retrieved successfully",
+    data: { user },
   });
 });
 
@@ -84,100 +276,39 @@ exports.createAdmin = asyncHandler(async (req, res, next) => {
     return next(new ApiError("Invalid admin secret", 403));
   }
 
-  const userExist = await User.findOne({ email });
-  if (userExist) {
-    return next(new ApiError("User already exists", 400));
+  const sanitizedUsername = sanitizeInput(username);
+  const sanitizedEmail = sanitizeInput(email);
+  if (!sanitizedUsername || !sanitizedEmail || !password) {
+    return next(new ApiError("All fields are required", 400));
+  }
+
+  const existingUser = await User.findOne({
+    $or: [{ email: sanitizedEmail }, { username: sanitizedUsername }],
+  });
+  if (existingUser) {
+    return next(new ApiError("Username or email already exists", 400));
   }
 
   const user = await User.create({
-    username,
-    email,
+    username: sanitizedUsername,
+    email: sanitizedEmail,
     password,
     role: "admin",
   });
 
+  const token = generateToken(user._id);
+
   res.status(201).json({
-    message: "Admin created successfully",
-    user: formatUserResponse(user),
-    token: generateToken(user),
-  });
-});
-
-exports.updateProfile = asyncHandler(async (req, res, next) => {
-  const userId = req.user.id;
-  const { username } = req.body;
-  const user = await User.findById(userId);
-  if (!user) return next(new ApiError("User not found", 404));
-
-  if (username) user.username = username;
-  if (req.file) {
-    if (user.avatar && user.avatar !== "default-avatar.png") {
-      const oldAvatarPath = path.join(__dirname, "..", user.avatar);
-      try {
-        await fs.unlink(oldAvatarPath);
-      } catch (error) {
-        console.error("Error deleting old avatar:", error);
-      }
-    }
-    user.avatar = req.file.path;
-  }
-
-  await user.save();
-  res
-    .status(200)
-    .json({ message: "Profile updated", user: formatUserResponse(user) });
-});
-
-exports.getProfile = asyncHandler(async (req, res, next) => {
-  const userId = req.params.id || req.user.id;
-  const user = await User.findById(userId)
-    .select("-password")
-    .populate("followers following");
-  if (!user) return next(new ApiError("User not found", 404));
-  let stats = {};
-  if (user.role === "streamer") {
-    const videos = await Video.find({ uploader: userId });
-    stats = {
-      totalVideos: videos.length,
-      totalViews: videos.reduce((sum, v) => sum + v.views, 0),
-      totalLikes: videos.reduce((sum, v) => sum + v.likes.length, 0),
-    };
-  }
-  res.status(200).json({
-    message: "Profile retrieved",
-    user: formatUserResponse(user),
-    stats,
-  });
-});
-
-exports.followUser = asyncHandler(async (req, res, next) => {
-  const userId = req.user.id;
-  const targetId = req.params.id;
-  const targetUser = await User.findById(targetId);
-  if (!targetUser) return next(new ApiError("User not found", 404));
-  if (targetUser.followers.includes(userId))
-    return next(new ApiError("Already following", 400));
-  await User.findByIdAndUpdate(userId, { $push: { following: targetId } });
-  await User.findByIdAndUpdate(targetId, { $push: { followers: userId } });
-  res.status(200).json({ message: "Followed user" });
-});
-
-exports.unfollowUser = asyncHandler(async (req, res, next) => {
-  const userId = req.user.id;
-  const targetId = req.params.id;
-  const targetUser = await User.findById(targetId);
-  if (!targetUser) return next(new ApiError("User not found", 404));
-  await User.findByIdAndUpdate(userId, { $pull: { following: targetId } });
-  await User.findByIdAndUpdate(targetId, { $pull: { followers: userId } });
-  res.status(200).json({ message: "Unfollowed user" });
-});
-
-exports.getMe = asyncHandler(async (req, res, next) => {
-  const user = await User.findById(req.user.id).populate("followers following");
-  res.status(200).json({
     status: "success",
+    message: "Admin user created successfully",
     data: {
-      user: formatUserResponse(user),
+      user: {
+        _id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+      },
+      token,
     },
   });
 });

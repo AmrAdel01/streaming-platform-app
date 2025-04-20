@@ -1,25 +1,32 @@
 const mongoose = require("mongoose");
-const Video = require("./../model/Video");
-const User = require("./../model/User");
+const Video = require("../model/Video");
+const User = require("../model/User");
 const asyncHandler = require("express-async-handler");
 const ApiError = require("./../utils/ApiError");
-const ffmpeg = require("fluent-ffmpeg");
 const path = require("path");
-const fsPromises = require("fs").promises; // For promise-based methods
 const fs = require("fs");
+const fsPromises = require("fs").promises;
+const { Queue } = require("bullmq");
 const { getIO } = require("../utils/socket");
 const { createNotification } = require("./notification");
-const { transcodeVideo } = require("../utils/transcode");
 const { sanitizeInput } = require("../utils/sanitize");
 
-if (process.env.FFMPEG_PATH) {
-  ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
-}
+const connection = {
+  host: process.env.REDIS_HOST || "localhost",
+  port: parseInt(process.env.REDIS_PORT) || 6379,
+};
+
+const transcodeQueue = new Queue("transcodeQueue", { connection });
 
 const generateThumbnail = async (videoPath, thumbnailPath) => {
   console.log("Generating thumbnail with FFmpeg...");
   console.log("Video path:", videoPath);
   console.log("Thumbnail path:", thumbnailPath);
+
+  const ffmpeg = require("fluent-ffmpeg");
+  if (process.env.FFMPEG_PATH) {
+    ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
+  }
 
   try {
     if (
@@ -69,7 +76,7 @@ const generateThumbnail = async (videoPath, thumbnailPath) => {
   }
 };
 
-exports.uploadVideos = asyncHandler(async (req, res, next) => {
+exports.uploadVideo = asyncHandler(async (req, res, next) => {
   const { title, category } = req.body;
   const userId = req.user.id;
 
@@ -90,10 +97,14 @@ exports.uploadVideos = asyncHandler(async (req, res, next) => {
 
   const videoFile = req.files.video[0];
   const tempPath = videoFile.path;
-  const videoId = new mongoose.Types.ObjectId().toString();
+  const videoId = new mongoose.Types.ObjectId();
 
   const getDuration = (filePath) =>
     new Promise((resolve, reject) => {
+      const ffmpeg = require("fluent-ffmpeg");
+      if (process.env.FFMPEG_PATH) {
+        ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
+      }
       ffmpeg.ffprobe(filePath, (err, metadata) => {
         if (err) return reject(err);
         resolve(metadata.format.duration || 0);
@@ -110,7 +121,7 @@ exports.uploadVideos = asyncHandler(async (req, res, next) => {
   let thumbnailPath;
   try {
     if (req.files.thumbnail && req.files.thumbnail[0]) {
-      thumbnailPath = `/uploads/${path.basename(req.files.thumbnail[0].path)}`;
+      thumbnailPath = `/Uploads/${path.basename(req.files.thumbnail[0].path)}`;
       if (
         !(await fsPromises
           .access(req.files.thumbnail[0].path)
@@ -125,7 +136,7 @@ exports.uploadVideos = asyncHandler(async (req, res, next) => {
       )}.jpg`;
       const thumbnailFullPath = path.join("uploads", thumbnailName);
       await generateThumbnail(tempPath, thumbnailFullPath);
-      thumbnailPath = `/uploads/${thumbnailName}`;
+      thumbnailPath = `/Uploads/${thumbnailName}`;
     }
   } catch (error) {
     console.error("Thumbnail error:", error);
@@ -140,27 +151,42 @@ exports.uploadVideos = asyncHandler(async (req, res, next) => {
     );
   }
 
-  let hlsPath;
-  try {
-    console.log("Transcoding video with parameters:", {
-      inputPath: tempPath,
-      outputDir: "uploads/videos",
-      videoId,
-    });
-    hlsPath = await transcodeVideo(tempPath, "uploads/videos", videoId);
-    console.log("Transcoding succeeded, hlsPath:", hlsPath);
+  const outputDir = path.join(
+    __dirname,
+    "../Uploads/videos",
+    videoId.toString()
+  );
 
-    const absoluteHlsPath = path.join(__dirname, "../", hlsPath);
-    if (
-      !(await fsPromises
-        .access(absoluteHlsPath)
-        .then(() => true)
-        .catch(() => false))
-    ) {
-      throw new Error("HLS master playlist file not found after transcoding");
-    }
+  const video = await Video.create({
+    _id: videoId,
+    title: sanitizedTitle,
+    uploader: userId,
+    category: sanitizedCategory || "Other",
+    status: "pending",
+    thumbnail: thumbnailPath,
+    duration: Math.round(duration),
+  });
+
+  try {
+    await transcodeQueue.add(
+      "transcode",
+      {
+        inputPath: tempPath,
+        outputDir,
+        videoId: videoId.toString(),
+        videoDocId: video._id,
+      },
+      {
+        attempts: 3,
+        backoff: {
+          type: "exponential",
+          delay: 1000,
+        },
+      }
+    );
+    console.log(`Transcoding job enqueued for videoId: ${videoId}`);
   } catch (error) {
-    console.error("Transcoding failed:", error);
+    console.error("Failed to enqueue transcoding job:", error);
     await fsPromises
       .unlink(tempPath)
       .catch((err) => console.error("Failed to delete temp file:", err));
@@ -170,23 +196,9 @@ exports.uploadVideos = asyncHandler(async (req, res, next) => {
         .catch((err) => console.error("Failed to delete thumbnail:", err));
     }
     return next(
-      new ApiError(`Failed to transcode video: ${error.message}`, 500)
+      new ApiError(`Failed to enqueue transcoding job: ${error.message}`, 500)
     );
   }
-
-  await fsPromises
-    .unlink(tempPath)
-    .catch((err) => console.error("Failed to delete temp file:", err));
-
-  const video = await Video.create({
-    title: sanitizedTitle,
-    hlsPath,
-    uploader: userId,
-    category: sanitizedCategory || "Other",
-    status: "pending",
-    thumbnail: thumbnailPath,
-    duration: Math.round(duration),
-  });
 
   const streamer = await User.findById(userId).populate("followers");
   const followers = streamer.followers || [];
@@ -218,7 +230,7 @@ exports.uploadVideos = asyncHandler(async (req, res, next) => {
   );
 
   res.status(201).json({
-    message: "Video uploaded and transcoded, awaiting review",
+    message: "Video uploaded and transcoding enqueued, awaiting review",
     videoId: video._id,
   });
 });
@@ -234,8 +246,23 @@ exports.streamVideo = asyncHandler(async (req, res, next) => {
     return next(new ApiError("Video not found", 404));
   }
 
+  if (video.status !== "live") {
+    console.error(`Video not available, status: ${video.status}`);
+    return next(new ApiError("Video is not available for streaming", 403));
+  }
+
   const hlsPath = video.hlsPath;
   console.log("Stored hlsPath:", hlsPath);
+
+  if (!hlsPath) {
+    console.error(`No hlsPath for video: ${videoId}`);
+    return next(
+      new ApiError(
+        "Video stream not ready. Transcoding may be incomplete.",
+        422
+      )
+    );
+  }
 
   // Construct the base directory of the HLS files
   const hlsBaseDir = path.dirname(hlsPath); // e.g., "uploads/videos/12345"
@@ -243,17 +270,17 @@ exports.streamVideo = asyncHandler(async (req, res, next) => {
 
   // Check if the request is for the master playlist or a segment
   const pathParts = req.path.split("/stream/")[1]; // e.g., "12345" or "12345/v0/segment_000.ts"
-  const isMasterRequest = pathParts === videoId; // Request for master playlist (e.g., "/api/videos/stream/12345")
+  const isMasterRequest = pathParts === videoId; // Request for master playlist
 
   if (isMasterRequest) {
-    requestedPath = hlsPath; // Master playlist (e.g., "uploads/videos/12345/master.m3u8")
+    requestedPath = hlsPath; // Master playlist
   } else {
-    // For segment files (e.g., "/api/videos/stream/12345/v0/segment_000.ts")
-    const segmentPath = pathParts; // e.g., "12345/v0/segment_000.ts"
+    // For segment files
+    const segmentPath = pathParts;
     requestedPath = path.join(
       hlsBaseDir,
       segmentPath.split("/").slice(1).join("/")
-    ); // e.g., "uploads/videos/12345/v0/segment_000.ts"
+    );
   }
 
   // Convert to absolute path
@@ -271,7 +298,7 @@ exports.streamVideo = asyncHandler(async (req, res, next) => {
     return next(new ApiError("HLS file not found", 404));
   }
 
-  // Check if the path is a file, not a directory
+  // Check if the path is a file
   const stats = await fsPromises.stat(absolutePath);
   if (stats.isDirectory()) {
     console.error("Requested path is a directory, not a file:", absolutePath);
@@ -375,7 +402,7 @@ exports.getUserVideos = asyncHandler(async (req, res, next) => {
   );
   res.status(200).json({
     message: "Videos retrieved",
-    videos, // thumbnail and duration are included automatically
+    videos,
     total,
     page: Math.ceil(skip / limit) + 1,
   });
@@ -417,7 +444,6 @@ exports.searchVideo = asyncHandler(async (req, res, next) => {
     return next(new ApiError("Invalid limit or skip parameters", 400));
   }
 
-  // Escape special characters for $text search
   const escapedQuery = sanitizedQuery.replace(
     /[-[\]{}()*+?.,\\^$|#\s]/g,
     "\\$&"
@@ -560,7 +586,6 @@ exports.toggleVideoStatus = asyncHandler(async (req, res, next) => {
   video.status = status;
   await video.save();
 
-  // Notify followers when video goes live
   if (status === "live") {
     const streamer = await User.findById(video.uploader).populate("followers");
     const followers = streamer.followers;
@@ -631,12 +656,13 @@ exports.getViewerCount = asyncHandler(async (req, res, next) => {
     count: viewerCount,
   });
 });
+
 exports.getTrendingVideos = asyncHandler(async (req, res, next) => {
-  const { limit = 6 } = req.query; // Default to 6 videos if limit is not provided
+  const { limit = 6 } = req.query;
   const videos = await Video.find({ status: "live" })
-    .sort({ views: -1, createdAt: -1 }) // Sort by views (descending) and creation date (descending)
+    .sort({ views: -1, createdAt: -1 })
     .limit(parseInt(limit))
-    .populate("uploader", "username"); // Populate uploader's username
+    .populate("uploader", "username");
   res.status(200).json({
     videos,
   });
@@ -646,7 +672,7 @@ exports.getVideoDetails = asyncHandler(async (req, res, next) => {
   const videoId = req.params.id;
   const video = await Video.findById(videoId)
     .populate("uploader", "username avatar")
-    .populate("comments.user", "username avatar"); // Add this to populate comment users
+    .populate("comments.user", "username avatar");
   if (!video) {
     return next(new ApiError("Video not found", 404));
   }
