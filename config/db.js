@@ -7,8 +7,6 @@ const dbConnection = async () => {
       throw new Error("DB_URL is not defined or not a string in .env file");
     }
     await mongoose.connect(dbUrl, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
       connectTimeoutMS: 10000,

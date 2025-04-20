@@ -10,13 +10,10 @@ const { Queue } = require("bullmq");
 const { getIO } = require("../utils/socket");
 const { createNotification } = require("./notification");
 const { sanitizeInput } = require("../utils/sanitize");
+// const { getRedisClient } = require("../utils/redis");
+const redisClient = require("../utils/redis");
 
-const connection = {
-  host: process.env.REDIS_HOST || "localhost",
-  port: parseInt(process.env.REDIS_PORT) || 6379,
-};
-
-const transcodeQueue = new Queue("transcodeQueue", { connection });
+const transcodeQueue = new Queue("transcodeQueue", { connection: redisClient });
 
 const generateThumbnail = async (videoPath, thumbnailPath) => {
   console.log("Generating thumbnail with FFmpeg...");
@@ -264,18 +261,15 @@ exports.streamVideo = asyncHandler(async (req, res, next) => {
     );
   }
 
-  // Construct the base directory of the HLS files
-  const hlsBaseDir = path.dirname(hlsPath); // e.g., "uploads/videos/12345"
+  const hlsBaseDir = path.dirname(hlsPath);
   let requestedPath;
 
-  // Check if the request is for the master playlist or a segment
-  const pathParts = req.path.split("/stream/")[1]; // e.g., "12345" or "12345/v0/segment_000.ts"
-  const isMasterRequest = pathParts === videoId; // Request for master playlist
+  const pathParts = req.path.split("/stream/")[1];
+  const isMasterRequest = pathParts === videoId;
 
   if (isMasterRequest) {
-    requestedPath = hlsPath; // Master playlist
+    requestedPath = hlsPath;
   } else {
-    // For segment files
     const segmentPath = pathParts;
     requestedPath = path.join(
       hlsBaseDir,
@@ -283,11 +277,9 @@ exports.streamVideo = asyncHandler(async (req, res, next) => {
     );
   }
 
-  // Convert to absolute path
   const absolutePath = path.join(__dirname, "../", requestedPath);
   console.log("Attempting to access file at:", absolutePath);
 
-  // Check if the path exists
   if (
     !(await fsPromises
       .access(absolutePath)
@@ -298,7 +290,6 @@ exports.streamVideo = asyncHandler(async (req, res, next) => {
     return next(new ApiError("HLS file not found", 404));
   }
 
-  // Check if the path is a file
   const stats = await fsPromises.stat(absolutePath);
   if (stats.isDirectory()) {
     console.error("Requested path is a directory, not a file:", absolutePath);
@@ -313,7 +304,6 @@ exports.streamVideo = asyncHandler(async (req, res, next) => {
       ? "video/mp2t"
       : "application/octet-stream";
 
-  // Add range request support for .ts files
   if (ext === ".ts") {
     const fileSize = stats.size;
     const range = req.headers.range;
