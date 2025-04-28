@@ -65,6 +65,48 @@ const withRetry = async (operation, maxRetries = 3, delay = 1000) => {
   }
 };
 
+// Cleanup function for failed jobs
+const cleanupFailedJob = async (inputPath, outputDir, videoDocId) => {
+  try {
+    // Clean up input file
+    if (inputPath) {
+      await fsPromises
+        .unlink(inputPath)
+        .catch((err) =>
+          console.error(
+            `Failed to delete input file ${inputPath}:`,
+            err.message
+          )
+        );
+    }
+
+    // Clean up output directory
+    if (outputDir) {
+      await fsPromises
+        .rm(outputDir, { recursive: true, force: true })
+        .catch((err) =>
+          console.error(
+            `Failed to delete output directory ${outputDir}:`,
+            err.message
+          )
+        );
+    }
+
+    // Update video status
+    if (videoDocId) {
+      await Video.findByIdAndUpdate(videoDocId, { status: "failed" }).catch(
+        (err) =>
+          console.error(
+            `Failed to update video status for ${videoDocId}:`,
+            err.message
+          )
+      );
+    }
+  } catch (error) {
+    console.error("Cleanup failed:", error);
+  }
+};
+
 initMongoDB();
 
 const transcodeWorker = new Worker(
@@ -77,6 +119,9 @@ const transcodeWorker = new Worker(
     console.log(`Job data:`, { inputPath, outputDir });
 
     try {
+      // Update progress: Starting
+      await job.updateProgress(0);
+
       // Verify input file exists
       console.log(`Checking input file: ${inputPath}`);
       if (
@@ -89,16 +134,33 @@ const transcodeWorker = new Worker(
       }
       console.log(`Input file verified: ${inputPath}`);
 
+      // Update progress: Input verified
+      await job.updateProgress(10);
+
       // Ensure output directory exists
       console.log(`Creating output directory: ${outputDir}`);
       await fsPromises.mkdir(outputDir, { recursive: true });
       console.log(`Output directory ensured: ${outputDir}`);
 
+      // Update progress: Output directory created
+      await job.updateProgress(20);
+
       // Run transcoding
       console.log(`Starting transcoding for videoId: ${videoId}`);
-      const hlsPath = await transcodeVideo(inputPath, outputDir, videoId);
+      const hlsPath = await transcodeVideo(
+        inputPath,
+        outputDir,
+        videoId,
+        (progress) => {
+          // Update progress from transcoding (20-80%)
+          job.updateProgress(20 + progress * 0.6);
+        }
+      );
       const absoluteHlsPath = path.join(__dirname, "../", hlsPath);
       console.log(`Transcoding completed, hlsPath: ${hlsPath}`);
+
+      // Update progress: Transcoding complete
+      await job.updateProgress(80);
 
       // Verify HLS output
       console.log(`Checking HLS output: ${absoluteHlsPath}`);
@@ -112,12 +174,15 @@ const transcodeWorker = new Worker(
       }
       console.log(`HLS output verified: ${absoluteHlsPath}`);
 
+      // Update progress: Output verified
+      await job.updateProgress(90);
+
       // Update video document with retry
       console.log(`Updating video document for ID: ${videoDocId}`);
       const video = await withRetry(async () => {
         const updatedVideo = await Video.findByIdAndUpdate(
           videoDocId,
-          { hlsPath, status: "pending" },
+          { hlsPath, status: "live" },
           { new: true }
         );
         if (!updatedVideo) {
@@ -140,6 +205,9 @@ const transcodeWorker = new Worker(
           )
         );
 
+      // Update progress: Complete
+      await job.updateProgress(100);
+
       return { videoId, hlsPath };
     } catch (error) {
       console.error(
@@ -150,36 +218,8 @@ const transcodeWorker = new Worker(
         }
       );
 
-      // Update video status to failed with retry
-      console.log(`Updating video status to failed for ID: ${videoDocId}`);
-      await withRetry(async () => {
-        const video = await Video.findByIdAndUpdate(
-          videoDocId,
-          { status: "failed" },
-          { new: true }
-        );
-        if (video) {
-          console.log(`Video status updated to failed for ID: ${videoDocId}`);
-        } else {
-          console.warn(
-            `Video document not found for ID: ${videoDocId} during failure update`
-          );
-        }
-      }).catch((err) => {
-        console.error(
-          `Failed to update video status to failed for ID: ${videoDocId}:`,
-          err.message
-        );
-      });
-
-      // Clean up partial output
-      console.log(`Cleaning up partial output: ${outputDir}`);
-      const outputPath = path.join(outputDir, videoId);
-      await fsPromises
-        .rm(outputPath, { recursive: true, force: true })
-        .catch((err) =>
-          console.error(`Cleanup failed for ${outputPath}:`, err.message)
-        );
+      // Cleanup failed job
+      await cleanupFailedJob(inputPath, outputDir, videoDocId);
 
       // Notify admins
       console.log(`Notifying admins for transcoding failure: ${videoId}`);
@@ -227,6 +267,10 @@ transcodeWorker.on("failed", (job, err) => {
 
 transcodeWorker.on("active", (job) => {
   console.log(`Job ${job.id} for videoId ${job.data.videoId} is now active`);
+});
+
+transcodeWorker.on("progress", (job, progress) => {
+  console.log(`Job ${job.id} progress: ${progress}%`);
 });
 
 module.exports = transcodeWorker;

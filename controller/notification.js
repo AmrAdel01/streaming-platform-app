@@ -4,7 +4,7 @@ const mongoose = require("mongoose");
 const ApiError = require("../utils/ApiError");
 
 exports.createNotification = asyncHandler(
-  async (userId, message, type, targetId, targetModel) => {
+  async (userId, message, type, referenceId, referenceModel) => {
     if (
       ![
         "video_upload",
@@ -16,23 +16,24 @@ exports.createNotification = asyncHandler(
         "video_approved",
         "video_rejected",
         "report_update",
+        "transcode_failure",
       ].includes(type)
     ) {
       throw new ApiError("Invalid notification type", 400);
     }
-    if (!mongoose.Types.ObjectId.isValid(targetId)) {
-      throw new ApiError("Invalid target ID", 400);
+    if (!mongoose.Types.ObjectId.isValid(referenceId)) {
+      throw new ApiError("Invalid reference ID", 400);
     }
-    if (!["Video", "User", "Comment"].includes(targetModel)) {
-      throw new ApiError("Invalid target model", 400);
+    if (!["Video", "Report"].includes(referenceModel)) {
+      throw new ApiError("Invalid reference model", 400);
     }
 
     return await Notification.create({
-      user: userId,
+      recipient: userId,
       message,
       type,
-      target: targetId,
-      targetModel,
+      referenceId,
+      referenceModel,
     });
   }
 );
@@ -52,34 +53,34 @@ exports.getNotifications = asyncHandler(async (req, res, next) => {
     return next(new ApiError("Invalid limit or skip parameters", 400));
   }
 
-  const notifications = await Notification.find({ user: userId })
+  const notifications = await Notification.find({ recipient: userId })
     .populate({
-      path: "target",
+      path: "referenceId",
       strictPopulate: false,
-      model: (notification) => notification.targetModel,
+      model: (notification) => notification.referenceModel,
     })
     .sort({ createdAt: -1 })
     .limit(parsedLimit)
     .skip(parsedSkip)
     .lean()
-    .select("message type target targetModel read createdAt");
+    .select("message type referenceId referenceModel read createdAt");
 
-  // Filter out notifications with invalid or deleted targets
+  // Filter out notifications with invalid or deleted references
   const validNotifications = notifications.filter((n) => {
-    if (!n.target) {
-      console.warn(`Notification ${n._id} has no valid target`);
+    if (!n.referenceId) {
+      console.warn(`Notification ${n._id} has no valid reference`);
       return false;
     }
     return true;
   });
 
   const total = await Notification.countDocuments({
-    user: userId,
-    target: { $exists: true },
+    recipient: userId,
+    referenceId: { $exists: true },
   });
 
   const unread = await Notification.countDocuments({
-    user: userId,
+    recipient: userId,
     read: false,
   });
 
@@ -95,7 +96,7 @@ exports.markAsRead = asyncHandler(async (req, res, next) => {
   const userId = req.user.id;
 
   const notification = await Notification.findOneAndUpdate(
-    { _id: notificationId, user: userId },
+    { _id: notificationId, recipient: userId },
     { read: true },
     { new: true }
   ).lean();

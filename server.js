@@ -17,18 +17,46 @@ if (envResult.error) {
   process.exit(1);
 }
 
-if (!process.env.DB_URL) {
-  console.error("DB_URL is not defined in .env file");
+// Debug email configuration
+console.log("Email Configuration:");
+console.log("EMAIL_HOST:", process.env.EMAIL_HOST);
+console.log("EMAIL_PORT:", process.env.EMAIL_PORT);
+console.log("EMAIL_SECURE:", process.env.EMAIL_SECURE);
+console.log("EMAIL_USER:", process.env.EMAIL_USER);
+console.log("EMAIL_PASSWORD:", process.env.EMAIL_PASSWORD ? "****" : "not set");
+
+// Validate required environment variables
+const requiredEnvVars = [
+  "DB_URL",
+  "REDIS_URL",
+  "JWT_SECRET",
+  "NODE_ENV",
+  "EMAIL_HOST",
+  "EMAIL_PORT",
+  "EMAIL_USER",
+  "EMAIL_PASSWORD",
+];
+
+const missingEnvVars = requiredEnvVars.filter((envVar) => !process.env[envVar]);
+if (missingEnvVars.length > 0) {
+  console.error(
+    `Missing required environment variables: ${missingEnvVars.join(", ")}`
+  );
   process.exit(1);
 }
 
-if (!process.env.REDIS_URL) {
-  console.error("REDIS_URL is not defined in .env file");
-  process.exit(1);
-}
-
+// Redis configuration with reconnection strategy
 const redisClient = redis.createClient({
-  url: process.env.REDIS_URL || "redis://localhost:6379",
+  url: process.env.REDIS_URL,
+  socket: {
+    reconnectStrategy: (retries) => {
+      if (retries > 10) {
+        console.error("Redis max reconnection attempts reached");
+        return new Error("Redis max reconnection attempts reached");
+      }
+      return Math.min(retries * 100, 3000);
+    },
+  },
 });
 
 redisClient.on("error", (err) => {
@@ -83,22 +111,28 @@ const globalMiddleware = require("./middleware/errorMiddleware");
 
 const app = express();
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-});
-
 const corsOptions = {
   origin: process.env.CORS_ORIGIN || "http://localhost:8080",
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization", "Range"],
   exposedHeaders: ["Content-Range", "Accept-Ranges"],
+  credentials: true,
+  maxAge: 86400, // 24 hours
 };
+
+// Rate limiting configuration
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: "Too many requests from this IP, please try again later.",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 app.use(express.json());
 app.use(sanitizeBody);
 app.use(cors(corsOptions));
-app.use("/uploads", express.static(path.join(__dirname, "Uploads")));
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 app.use(limiter);
 
 if (process.env.NODE_ENV !== "production") {
@@ -118,6 +152,17 @@ app.use("/api/recommendations", recommendationRouter);
 app.use("/api/moderation", moderationRouter);
 
 app.use(globalMiddleware);
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(err.status || 500).json({
+    error: {
+      message: err.message || "Internal Server Error",
+      ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
+    },
+  });
+});
 
 const server = http.createServer(app);
 const port = process.env.PORT || 3000;
@@ -142,17 +187,25 @@ getIO().on("connection", (socket) => {
       .emit("viewerCountUpdate", { videoId, count: parseInt(count) });
   });
 
+  socket.on("error", (error) => {
+    console.error("Socket error:", error);
+  });
+
   socket.on("disconnect", async () => {
-    for (const room of socket.rooms) {
-      if (room !== socket.id && !room.startsWith("user_")) {
-        await redisClient.hIncrBy("videoViewers", room, -1);
-        const count = await redisClient.hGet("videoViewers", room);
-        getIO()
-          .to(room)
-          .emit("viewerCountUpdate", { room, count: parseInt(count) });
-        if (count <= 0) await redisClient.hDel("videoViewers", room);
-        await redisClient.expire("videoViewers", 24 * 60 * 60);
+    try {
+      for (const room of socket.rooms) {
+        if (room !== socket.id && !room.startsWith("user_")) {
+          await redisClient.hIncrBy("videoViewers", room, -1);
+          const count = await redisClient.hGet("videoViewers", room);
+          getIO()
+            .to(room)
+            .emit("viewerCountUpdate", { room, count: parseInt(count) });
+          if (count <= 0) await redisClient.hDel("videoViewers", room);
+          await redisClient.expire("videoViewers", 24 * 60 * 60);
+        }
       }
+    } catch (error) {
+      console.error("Error in disconnect handler:", error);
     }
   });
 });

@@ -13,12 +13,20 @@ const { sanitizeInput } = require("../utils/sanitize");
 // const { getRedisClient } = require("../utils/redis");
 const redisClient = require("../utils/redis");
 
+// Constants for video validation
+const ALLOWED_FORMATS = ["mp4", "mov", "avi", "mkv", "webm"];
+const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500MB
+const MAX_TITLE_LENGTH = 100;
+const MAX_DESCRIPTION_LENGTH = 1000;
+
 const transcodeQueue = new Queue("transcodeQueue", { connection: redisClient });
 
-const generateThumbnail = async (videoPath, thumbnailPath) => {
+const generateThumbnail = async (videoPath, outputDir, options = {}) => {
   console.log("Generating thumbnail with FFmpeg...");
   console.log("Video path:", videoPath);
-  console.log("Thumbnail path:", thumbnailPath);
+  console.log("Output directory:", outputDir);
+
+  const { time = 5, size = "320x180" } = options;
 
   const ffmpeg = require("fluent-ffmpeg");
   if (process.env.FFMPEG_PATH) {
@@ -35,9 +43,15 @@ const generateThumbnail = async (videoPath, thumbnailPath) => {
       throw new Error("Video file does not exist at path: " + videoPath);
     }
 
-    const uploadsDir = path.dirname(thumbnailPath);
-    await fsPromises.mkdir(uploadsDir, { recursive: true });
-    console.log("Ensured uploads directory exists:", uploadsDir);
+    // Ensure output directory exists
+    await fsPromises.mkdir(outputDir, { recursive: true });
+    console.log("Ensured output directory exists:", outputDir);
+
+    // Generate a unique filename for the thumbnail
+    const thumbnailName = `thumbnail-${Date.now()}-${Math.round(
+      Math.random() * 1e9
+    )}.jpg`;
+    const thumbnailPath = path.join(outputDir, thumbnailName);
 
     const duration = await new Promise((resolve, reject) => {
       ffmpeg.ffprobe(videoPath, (err, metadata) => {
@@ -46,13 +60,13 @@ const generateThumbnail = async (videoPath, thumbnailPath) => {
       });
     });
 
-    const timemark = duration < 5 ? "0" : "5";
+    const timemark = duration < time ? "0" : time.toString();
 
     return new Promise((resolve, reject) => {
       ffmpeg(videoPath)
         .on("end", () => {
-          console.log("Thumbnail generated successfully");
-          resolve();
+          console.log("Thumbnail generated successfully at:", thumbnailPath);
+          resolve(thumbnailPath);
         })
         .on("error", (err, stdout, stderr) => {
           console.error("FFmpeg thumbnail error:", err.message);
@@ -62,9 +76,9 @@ const generateThumbnail = async (videoPath, thumbnailPath) => {
         })
         .screenshots({
           count: 1,
-          folder: path.dirname(thumbnailPath),
-          filename: path.basename(thumbnailPath),
-          size: "320x180",
+          folder: outputDir,
+          filename: thumbnailName,
+          size: size,
           timemarks: [timemark],
         });
     });
@@ -73,15 +87,101 @@ const generateThumbnail = async (videoPath, thumbnailPath) => {
   }
 };
 
+const getVideoMetadata = async (videoPath) => {
+  console.log("Getting video metadata with FFmpeg...");
+  console.log("Video path:", videoPath);
+
+  const ffmpeg = require("fluent-ffmpeg");
+  if (process.env.FFMPEG_PATH) {
+    ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
+  }
+
+  try {
+    if (
+      !(await fsPromises
+        .access(videoPath)
+        .then(() => true)
+        .catch(() => false))
+    ) {
+      throw new Error("Video file does not exist at path: " + videoPath);
+    }
+
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) {
+          console.error("FFmpeg metadata error:", err.message);
+          return reject(
+            new Error(`Failed to get video metadata: ${err.message}`)
+          );
+        }
+
+        const videoStream = metadata.streams.find(
+          (s) => s.codec_type === "video"
+        );
+        const audioStream = metadata.streams.find(
+          (s) => s.codec_type === "audio"
+        );
+
+        if (!videoStream) {
+          return reject(new Error("No video stream found in file"));
+        }
+
+        const result = {
+          format: metadata.format.format_name,
+          duration: metadata.format.duration,
+          size: metadata.format.size,
+          bitrate: metadata.format.bit_rate,
+          video: {
+            codec: videoStream.codec_name,
+            width: videoStream.width,
+            height: videoStream.height,
+            fps: eval(videoStream.r_frame_rate) || null,
+          },
+          audio: {
+            codec: audioStream ? audioStream.codec_name : null,
+          },
+        };
+
+        console.log("Video metadata extracted successfully");
+        resolve(result);
+      });
+    });
+  } catch (err) {
+    throw new ApiError(`Failed to get video metadata: ${err.message}`, 500);
+  }
+};
+
 exports.uploadVideo = asyncHandler(async (req, res, next) => {
-  const { title, category } = req.body;
+  const { title, category, description } = req.body;
   const userId = req.user.id;
 
+  // Input validation
   const sanitizedTitle = sanitizeInput(title);
   const sanitizedCategory = sanitizeInput(category);
+  const sanitizedDescription = sanitizeInput(description);
+
   if (!sanitizedTitle) {
     return next(new ApiError("Please provide a valid title", 400));
   }
+
+  if (sanitizedTitle.length > MAX_TITLE_LENGTH) {
+    return next(
+      new ApiError(`Title cannot exceed ${MAX_TITLE_LENGTH} characters`, 400)
+    );
+  }
+
+  if (
+    sanitizedDescription &&
+    sanitizedDescription.length > MAX_DESCRIPTION_LENGTH
+  ) {
+    return next(
+      new ApiError(
+        `Description cannot exceed ${MAX_DESCRIPTION_LENGTH} characters`,
+        400
+      )
+    );
+  }
+
   if (req.user.role !== "streamer") {
     return res
       .status(403)
@@ -93,78 +193,71 @@ exports.uploadVideo = asyncHandler(async (req, res, next) => {
   }
 
   const videoFile = req.files.video[0];
-  const tempPath = videoFile.path;
-  const videoId = new mongoose.Types.ObjectId();
 
-  const getDuration = (filePath) =>
-    new Promise((resolve, reject) => {
-      const ffmpeg = require("fluent-ffmpeg");
-      if (process.env.FFMPEG_PATH) {
-        ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
-      }
-      ffmpeg.ffprobe(filePath, (err, metadata) => {
-        if (err) return reject(err);
-        resolve(metadata.format.duration || 0);
-      });
-    });
-
-  let duration = 0;
-  try {
-    duration = await getDuration(tempPath);
-  } catch (err) {
-    console.error(`Failed to get duration: ${err.message}`);
-  }
-
-  let thumbnailPath;
-  try {
-    if (req.files.thumbnail && req.files.thumbnail[0]) {
-      thumbnailPath = `/Uploads/${path.basename(req.files.thumbnail[0].path)}`;
-      if (
-        !(await fsPromises
-          .access(req.files.thumbnail[0].path)
-          .then(() => true)
-          .catch(() => false))
-      ) {
-        throw new Error("Uploaded thumbnail is inaccessible");
-      }
-    } else {
-      const thumbnailName = `thumbnail-${Date.now()}-${Math.round(
-        Math.random() * 1e9
-      )}.jpg`;
-      const thumbnailFullPath = path.join("uploads", thumbnailName);
-      await generateThumbnail(tempPath, thumbnailFullPath);
-      thumbnailPath = `/Uploads/${thumbnailName}`;
-    }
-  } catch (error) {
-    console.error("Thumbnail error:", error);
-    await fsPromises
-      .unlink(tempPath)
-      .catch((err) => console.error("Failed to delete temp file:", err));
+  // File format validation
+  const fileExt = path.extname(videoFile.originalname).toLowerCase().slice(1);
+  if (!ALLOWED_FORMATS.includes(fileExt)) {
     return next(
       new ApiError(
-        `Failed to generate or upload thumbnail: ${error.message}`,
-        500
+        `Invalid video format. Allowed formats: ${ALLOWED_FORMATS.join(", ")}`,
+        400
       )
     );
   }
 
-  const outputDir = path.join(
-    __dirname,
-    "../Uploads/videos",
-    videoId.toString()
-  );
+  // File size validation
+  if (videoFile.size > MAX_FILE_SIZE) {
+    return next(
+      new ApiError(
+        `File too large. Maximum size is ${MAX_FILE_SIZE / (1024 * 1024)}MB`,
+        400
+      )
+    );
+  }
 
-  const video = await Video.create({
-    _id: videoId,
-    title: sanitizedTitle,
-    uploader: userId,
-    category: sanitizedCategory || "Other",
-    status: "pending",
-    thumbnail: thumbnailPath,
-    duration: Math.round(duration),
-  });
+  const tempPath = videoFile.path;
+  const videoId = new mongoose.Types.ObjectId();
 
   try {
+    // Generate thumbnail
+    const thumbnailDir = path.join("uploads", "thumbnails", videoId.toString());
+    const thumbnailPath = await generateThumbnail(tempPath, thumbnailDir, {
+      time: 5,
+      size: "320x180",
+    });
+
+    // Get video metadata
+    const metadata = await getVideoMetadata(tempPath);
+
+    const outputDir = path.join(
+      __dirname,
+      "../Uploads/videos",
+      videoId.toString()
+    );
+
+    const video = await Video.create({
+      _id: videoId,
+      title: sanitizedTitle,
+      uploader: userId,
+      category: sanitizedCategory || "Other",
+      status: "pending",
+      thumbnail: thumbnailPath,
+      duration: Math.round(metadata.duration),
+      metadata: {
+        format: metadata.format,
+        size: metadata.size,
+        bitrate: metadata.bitrate,
+        resolution: {
+          width: metadata.video.width,
+          height: metadata.video.height,
+        },
+        fps: metadata.video.fps,
+        audioCodec: metadata.audio.codec,
+        videoCodec: metadata.video.codec,
+      },
+    });
+
+    // Add transcoding job to queue
     await transcodeQueue.add(
       "transcode",
       {
@@ -181,55 +274,53 @@ exports.uploadVideo = asyncHandler(async (req, res, next) => {
         },
       }
     );
-    console.log(`Transcoding job enqueued for videoId: ${videoId}`);
-  } catch (error) {
-    console.error("Failed to enqueue transcoding job:", error);
-    await fsPromises
-      .unlink(tempPath)
-      .catch((err) => console.error("Failed to delete temp file:", err));
-    if (thumbnailPath && !req.files.thumbnail) {
-      await fsPromises
-        .unlink(path.join(__dirname, "../", thumbnailPath))
-        .catch((err) => console.error("Failed to delete thumbnail:", err));
-    }
-    return next(
-      new ApiError(`Failed to enqueue transcoding job: ${error.message}`, 500)
+
+    // Notify followers
+    const streamer = await User.findById(userId).populate("followers");
+    const followers = streamer.followers || [];
+    await Promise.all(
+      followers.map(async (follower) => {
+        const notification = await createNotification(
+          follower._id,
+          `${streamer.username} uploaded a new video: ${sanitizedTitle}`,
+          "video_upload",
+          video._id,
+          "Video"
+        );
+        getIO()
+          .to(follower._id.toString())
+          .emit("newNotification", notification);
+      })
     );
+
+    // Notify admins
+    const admins = await User.find({ role: "admin" });
+    await Promise.all(
+      admins.map(async (admin) => {
+        const notification = await createNotification(
+          admin._id,
+          `New video "${sanitizedTitle}" by ${streamer.username} awaits moderation`,
+          "video_pending",
+          video._id,
+          "Video"
+        );
+        getIO().to(admin._id.toString()).emit("newNotification", notification);
+      })
+    );
+
+    res.status(201).json({
+      message: "Video uploaded and transcoding enqueued, awaiting review",
+      videoId: video._id,
+      thumbnail: thumbnailPath,
+      metadata: video.metadata,
+    });
+  } catch (error) {
+    // Cleanup on error
+    if (fs.existsSync(tempPath)) {
+      await fsPromises.unlink(tempPath);
+    }
+    return next(new ApiError(`Video upload failed: ${error.message}`, 500));
   }
-
-  const streamer = await User.findById(userId).populate("followers");
-  const followers = streamer.followers || [];
-  await Promise.all(
-    followers.map(async (follower) => {
-      const notification = await createNotification(
-        follower._id,
-        `${streamer.username} uploaded a new video: ${sanitizedTitle}`,
-        "video_upload",
-        video._id,
-        "Video"
-      );
-      getIO().to(follower._id.toString()).emit("newNotification", notification);
-    })
-  );
-
-  const admins = await User.find({ role: "admin" });
-  await Promise.all(
-    admins.map(async (admin) => {
-      const notification = await createNotification(
-        admin._id,
-        `New video "${sanitizedTitle}" by ${streamer.username} awaits moderation`,
-        "video_pending",
-        video._id,
-        "Video"
-      );
-      getIO().to(admin._id.toString()).emit("newNotification", notification);
-    })
-  );
-
-  res.status(201).json({
-    message: "Video uploaded and transcoding enqueued, awaiting review",
-    videoId: video._id,
-  });
 });
 
 exports.streamVideo = asyncHandler(async (req, res, next) => {
